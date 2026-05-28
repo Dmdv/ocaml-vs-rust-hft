@@ -1,0 +1,4 @@
+(library
+ (name lob)
+ (ocamlopt_flags
+  (:standard -O3)))

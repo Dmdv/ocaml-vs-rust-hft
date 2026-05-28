@@ -1,0 +1,8 @@
+(executable
+ (name harness)
+ (libraries lob)
+ (foreign_stubs
+  (language c)
+  (names clock_stub))
+ (ocamlopt_flags
+  (:standard -O3)))
