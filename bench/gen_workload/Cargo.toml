@@ -1,0 +1,15 @@
+[package]
+name = "gen_workload"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral deterministic workload generator for the OCaml-vs-Rust order-book demo"
+
+[dependencies]
+rand = "0.8"
+rand_distr = "0.4"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
