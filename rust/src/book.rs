@@ -22,32 +22,6 @@ pub struct Trade {
     pub aggressor: Side,
 }
 
-/// Output sink. Generic + monomorphized => zero-cost; the hot path never allocates for trades.
-pub trait TradeSink {
-    fn trade(&mut self, t: Trade);
-}
-
-impl TradeSink for Vec<Trade> {
-    #[inline(always)]
-    fn trade(&mut self, t: Trade) {
-        self.push(t);
-    }
-}
-
-/// A counting sink for benchmarks: no allocation, no growth.
-#[derive(Default)]
-pub struct CountSink {
-    pub trades: u64,
-    pub volume: u64,
-}
-impl TradeSink for CountSink {
-    #[inline(always)]
-    fn trade(&mut self, t: Trade) {
-        self.trades += 1;
-        self.volume += t.qty as u64;
-    }
-}
-
 struct Node {
     id: u32,
     side: Side,
@@ -74,6 +48,9 @@ pub struct Book {
     id_to_idx: HashMap<u32, u32>,
     bb: i32, // best bid price, -1 when no bids
     ba: i32, // best ask price, MAX_PRICE when no asks
+    /// Trades produced by `process`, appended to a preallocated buffer (no per-trade allocation
+    /// once reserved, and — crucially for a fair cross-language comparison — no dynamic dispatch).
+    pub trades: Vec<Trade>,
 }
 
 impl Default for Book {
@@ -92,7 +69,16 @@ impl Book {
             id_to_idx: HashMap::with_capacity(1 << 20),
             bb: -1,
             ba: MAX_PRICE as i32,
+            trades: Vec::new(),
         }
+    }
+
+    /// Reserve trade-buffer capacity up front so the timed hot path never reallocates.
+    pub fn reserve_trades(&mut self, n: usize) {
+        self.trades.reserve(n);
+    }
+    pub fn clear_trades(&mut self) {
+        self.trades.clear();
     }
 
     #[inline]
@@ -122,6 +108,7 @@ impl Book {
     /// book never crossed; every resting order has qty>0, is filed under the right side/price,
     /// has intact links and an id-map entry; reachable count matches the id map; and the tracked
     /// best prices equal the true extremes.
+    #[allow(clippy::needless_range_loop)] // `p` is the price value, not just an index
     pub fn check_invariants(&self) -> Result<(), String> {
         if self.bb >= 0 && self.ba < MAX_PRICE as i32 && self.bb >= self.ba {
             return Err(format!("crossed book: bb={} ba={}", self.bb, self.ba));
@@ -177,28 +164,28 @@ impl Book {
     }
 
     #[inline]
-    pub fn process<S: TradeSink>(&mut self, m: &Msg, sink: &mut S) {
+    pub fn process(&mut self, m: &Msg) {
         match m.msg_type {
-            T_ADD => self.handle_limit(m.side, m.order_id, m.price, m.qty, sink),
-            T_MARKET => self.handle_market(m.side, m.order_id, m.qty, sink),
+            T_ADD => self.handle_limit(m.side, m.order_id, m.price, m.qty),
+            T_MARKET => self.handle_market(m.side, m.order_id, m.qty),
             T_CANCEL => self.handle_cancel(m.order_id),
-            T_REPLACE => self.handle_replace(m.order_id, m.new_price, m.new_qty, sink),
+            T_REPLACE => self.handle_replace(m.order_id, m.new_price, m.new_qty),
             _ => {}
         }
     }
 
     #[inline]
-    fn handle_limit<S: TradeSink>(&mut self, side: Side, id: u32, price: u32, qty: u32, sink: &mut S) {
-        let rem = self.cross(side, id, qty, price, sink);
+    fn handle_limit(&mut self, side: Side, id: u32, price: u32, qty: u32) {
+        let rem = self.cross(side, id, qty, price);
         if rem > 0 {
             self.rest(id, side, price, rem);
         }
     }
 
     #[inline]
-    fn handle_market<S: TradeSink>(&mut self, side: Side, id: u32, qty: u32, sink: &mut S) {
+    fn handle_market(&mut self, side: Side, id: u32, qty: u32) {
         let limit = if side == SIDE_BID { u32::MAX } else { 0 };
-        let _discarded = self.cross(side, id, qty, limit, sink);
+        let _discarded = self.cross(side, id, qty, limit);
     }
 
     fn handle_cancel(&mut self, id: u32) {
@@ -208,7 +195,7 @@ impl Book {
         }
     }
 
-    fn handle_replace<S: TradeSink>(&mut self, id: u32, new_price: u32, new_qty: u32, sink: &mut S) {
+    fn handle_replace(&mut self, id: u32, new_price: u32, new_qty: u32) {
         let idx = match self.id_to_idx.get(&id) {
             Some(&i) => i,
             None => return,
@@ -223,7 +210,7 @@ impl Book {
             self.unlink_and_free(idx);
             self.id_to_idx.remove(&id);
             if new_qty > 0 {
-                self.handle_limit(side, id, new_price, new_qty, sink);
+                self.handle_limit(side, id, new_price, new_qty);
             }
         }
     }
@@ -231,7 +218,7 @@ impl Book {
     /// Match `qty` from the aggressor `side` against resting orders while the price crosses
     /// `limit`. Returns the unfilled remainder. `limit` is the aggressor's price for a limit
     /// order, or `u32::MAX` (buy) / `0` (sell) for a market order.
-    fn cross<S: TradeSink>(&mut self, side: Side, taker: u32, mut qty: u32, limit: u32, sink: &mut S) -> u32 {
+    fn cross(&mut self, side: Side, taker: u32, mut qty: u32, limit: u32) -> u32 {
         if side == SIDE_BID {
             while qty > 0 {
                 let ba = self.ba;
@@ -249,7 +236,7 @@ impl Book {
                     let traded = if qty < node_qty { qty } else { node_qty };
                     self.nodes[h as usize].qty = node_qty - traded;
                     qty -= traded;
-                    sink.trade(Trade { maker: maker_id, taker, price: ap as u32, qty: traded, aggressor: SIDE_BID });
+                    self.trades.push(Trade { maker: maker_id, taker, price: ap as u32, qty: traded, aggressor: SIDE_BID });
                     if self.nodes[h as usize].qty == 0 {
                         let nxt = self.nodes[h as usize].next;
                         self.asks[ap].head = nxt;
@@ -283,7 +270,7 @@ impl Book {
                     let traded = if qty < node_qty { qty } else { node_qty };
                     self.nodes[h as usize].qty = node_qty - traded;
                     qty -= traded;
-                    sink.trade(Trade { maker: maker_id, taker, price: bp as u32, qty: traded, aggressor: SIDE_ASK });
+                    self.trades.push(Trade { maker: maker_id, taker, price: bp as u32, qty: traded, aggressor: SIDE_ASK });
                     if self.nodes[h as usize].qty == 0 {
                         let nxt = self.nodes[h as usize].next;
                         self.bids[bp].head = nxt;
@@ -440,16 +427,17 @@ mod tests {
     fn add(side: Side, id: u32, price: u32, qty: u32) -> Msg {
         Msg { msg_type: T_ADD, side, order_id: id, price, qty, new_price: 0, new_qty: 0 }
     }
-    fn run(book: &mut Book, m: Msg) -> Vec<Trade> {
-        let mut s = Vec::new();
-        book.process(&m, &mut s);
-        s
+    /// Process one message and return the trades it produced.
+    fn step(b: &mut Book, m: Msg) -> Vec<Trade> {
+        b.clear_trades();
+        b.process(&m);
+        b.trades.clone()
     }
 
     #[test]
     fn add_rests_without_crossing() {
         let mut b = Book::new();
-        assert!(run(&mut b, add(SIDE_BID, 1, 100, 10)).is_empty());
+        assert!(step(&mut b, add(SIDE_BID, 1, 100, 10)).is_empty());
         assert_eq!(b.best_bid(), Some(100));
         assert_eq!(b.best_ask(), None);
         assert_eq!(b.resting_count(), 1);
@@ -458,21 +446,20 @@ mod tests {
     #[test]
     fn crossing_limit_partial_fill_at_maker_price() {
         let mut b = Book::new();
-        run(&mut b, add(SIDE_ASK, 1, 100, 5));
-        // incoming aggressive buy at 105 should trade at the maker's 100 (price improvement)
-        let t = run(&mut b, add(SIDE_BID, 2, 105, 3));
+        step(&mut b, add(SIDE_ASK, 1, 100, 5));
+        let t = step(&mut b, add(SIDE_BID, 2, 105, 3));
         assert_eq!(t, vec![Trade { maker: 1, taker: 2, price: 100, qty: 3, aggressor: SIDE_BID }]);
-        assert_eq!(b.order_qty(1), Some(2)); // resting ask reduced
+        assert_eq!(b.order_qty(1), Some(2));
         assert_eq!(b.best_ask(), Some(100));
-        assert_eq!(b.best_bid(), None); // fully filled aggressor doesn't rest
+        assert_eq!(b.best_bid(), None);
     }
 
     #[test]
     fn sweeps_multiple_levels_in_price_then_time_priority() {
         let mut b = Book::new();
-        run(&mut b, add(SIDE_ASK, 1, 100, 2));
-        run(&mut b, add(SIDE_ASK, 2, 101, 2));
-        let t = run(&mut b, add(SIDE_BID, 3, 101, 3));
+        step(&mut b, add(SIDE_ASK, 1, 100, 2));
+        step(&mut b, add(SIDE_ASK, 2, 101, 2));
+        let t = step(&mut b, add(SIDE_BID, 3, 101, 3));
         assert_eq!(
             t,
             vec![
@@ -487,10 +474,9 @@ mod tests {
     #[test]
     fn fifo_time_priority_within_a_level() {
         let mut b = Book::new();
-        run(&mut b, add(SIDE_ASK, 1, 100, 2)); // earlier
-        run(&mut b, add(SIDE_ASK, 2, 100, 2)); // later
-        let t = run(&mut b, add(SIDE_BID, 3, 100, 3));
-        // order 1 (earlier) fully fills first, then order 2 partially
+        step(&mut b, add(SIDE_ASK, 1, 100, 2));
+        step(&mut b, add(SIDE_ASK, 2, 100, 2));
+        let t = step(&mut b, add(SIDE_BID, 3, 100, 3));
         assert_eq!(
             t,
             vec![
@@ -505,73 +491,70 @@ mod tests {
     #[test]
     fn market_order_consumes_then_discards_remainder() {
         let mut b = Book::new();
-        run(&mut b, add(SIDE_ASK, 1, 100, 2));
+        step(&mut b, add(SIDE_ASK, 1, 100, 2));
         let mkt = Msg { msg_type: T_MARKET, side: SIDE_BID, order_id: 9, price: 0, qty: 5, new_price: 0, new_qty: 0 };
-        let t = run(&mut b, mkt);
+        let t = step(&mut b, mkt);
         assert_eq!(t, vec![Trade { maker: 1, taker: 9, price: 100, qty: 2, aggressor: SIDE_BID }]);
-        assert_eq!(b.resting_count(), 0); // remainder (3) discarded, nothing rests
+        assert_eq!(b.resting_count(), 0);
     }
 
     #[test]
     fn market_on_empty_book_is_noop() {
         let mut b = Book::new();
         let mkt = Msg { msg_type: T_MARKET, side: SIDE_ASK, order_id: 9, price: 0, qty: 5, new_price: 0, new_qty: 0 };
-        assert!(run(&mut b, mkt).is_empty());
+        assert!(step(&mut b, mkt).is_empty());
     }
 
     #[test]
     fn cancel_present_and_absent() {
         let mut b = Book::new();
-        run(&mut b, add(SIDE_BID, 1, 100, 10));
-        run(&mut b, add(SIDE_BID, 2, 99, 10));
+        step(&mut b, add(SIDE_BID, 1, 100, 10));
+        step(&mut b, add(SIDE_BID, 2, 99, 10));
         let cancel = |id| Msg { msg_type: T_CANCEL, side: 0, order_id: id, price: 0, qty: 0, new_price: 0, new_qty: 0 };
-        run(&mut b, cancel(1));
+        step(&mut b, cancel(1));
         assert_eq!(b.order_qty(1), None);
-        assert_eq!(b.best_bid(), Some(99)); // best advanced down
-        run(&mut b, cancel(999)); // absent: no panic, no change
+        assert_eq!(b.best_bid(), Some(99));
+        step(&mut b, cancel(999));
         assert_eq!(b.resting_count(), 1);
     }
 
     #[test]
     fn replace_size_down_keeps_priority() {
         let mut b = Book::new();
-        run(&mut b, add(SIDE_ASK, 1, 100, 5));
-        run(&mut b, add(SIDE_ASK, 2, 100, 5)); // behind order 1
+        step(&mut b, add(SIDE_ASK, 1, 100, 5));
+        step(&mut b, add(SIDE_ASK, 2, 100, 5));
         let repl = Msg { msg_type: T_REPLACE, side: 0, order_id: 1, price: 0, qty: 0, new_price: 100, new_qty: 2 };
-        run(&mut b, repl);
+        step(&mut b, repl);
         assert_eq!(b.order_qty(1), Some(2));
-        // order 1 still ahead: a buy of 2 hits order 1 first
-        let t = run(&mut b, add(SIDE_BID, 3, 100, 2));
+        let t = step(&mut b, add(SIDE_BID, 3, 100, 2));
         assert_eq!(t, vec![Trade { maker: 1, taker: 3, price: 100, qty: 2, aggressor: SIDE_BID }]);
     }
 
     #[test]
     fn replace_price_change_loses_priority_and_can_cross() {
         let mut b = Book::new();
-        run(&mut b, add(SIDE_BID, 1, 100, 5)); // resting bid
-        run(&mut b, add(SIDE_ASK, 2, 105, 5)); // resting ask
-        // reprice the resting bid up to 105 -> it should cross the ask and trade at 105 (maker)
+        step(&mut b, add(SIDE_BID, 1, 100, 5));
+        step(&mut b, add(SIDE_ASK, 2, 105, 5));
         let repl = Msg { msg_type: T_REPLACE, side: 0, order_id: 1, price: 0, qty: 0, new_price: 105, new_qty: 5 };
-        let t = run(&mut b, repl);
+        let t = step(&mut b, repl);
         assert_eq!(t, vec![Trade { maker: 2, taker: 1, price: 105, qty: 5, aggressor: SIDE_BID }]);
         assert_eq!(b.resting_count(), 0);
     }
 
     #[test]
-    fn digest_is_order_independent_of_arena_reuse() {
-        // Two books reaching the same resting state via different paths must share a digest.
+    fn digest_independent_of_insertion_path() {
         let mut a = Book::new();
-        run(&mut a, add(SIDE_BID, 1, 100, 10));
-        run(&mut a, add(SIDE_ASK, 2, 200, 5));
+        step(&mut a, add(SIDE_BID, 1, 100, 10));
+        step(&mut a, add(SIDE_ASK, 2, 200, 5));
 
         let mut c = Book::new();
-        run(&mut c, add(SIDE_BID, 7, 100, 10)); // different id -> different digest expected
-        run(&mut c, add(SIDE_ASK, 8, 200, 5));
+        step(&mut c, add(SIDE_BID, 7, 100, 10));
+        step(&mut c, add(SIDE_ASK, 8, 200, 5));
         assert_ne!(a.digest(), c.digest());
 
         let mut d = Book::new();
-        run(&mut d, add(SIDE_ASK, 2, 200, 5)); // same orders, inserted in different order
-        run(&mut d, add(SIDE_BID, 1, 100, 10));
+        step(&mut d, add(SIDE_ASK, 2, 200, 5));
+        step(&mut d, add(SIDE_BID, 1, 100, 10));
         assert_eq!(a.digest(), d.digest());
     }
 }

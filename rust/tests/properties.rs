@@ -2,19 +2,18 @@
 //! and is deterministic. We synthesize *valid* streams (Add ids are unique and never reuse a
 //! live id, per spec) from raw proptest data, then assert invariants after every message.
 
-use lob::{Book, Msg, Trade, T_ADD, T_CANCEL, T_MARKET, T_REPLACE};
+use lob::{Book, Msg, T_ADD, T_CANCEL, T_MARKET, T_REPLACE};
 use proptest::prelude::*;
 
-/// Raw per-action data; mapped to a valid `Msg` against live-id state in the test body.
 #[derive(Clone, Copy, Debug)]
 struct Action {
-    kind: u8,  // 0=add 1=cancel 2=replace 3=market
-    side: u8,  // 0=bid 1=ask
+    kind: u8,
+    side: u8,
     price: u32,
     qty: u32,
     new_price: u32,
     new_qty: u32,
-    sel: usize, // selects a live order for cancel/replace
+    sel: usize,
 }
 
 fn action() -> impl Strategy<Value = Action> {
@@ -32,7 +31,7 @@ fn action() -> impl Strategy<Value = Action> {
 }
 
 /// Turn raw actions into a valid message stream (monotonic unique Add ids; cancel/replace only
-/// target ids we have handed out). Returns the messages actually issued.
+/// target ids we have handed out).
 fn build(actions: &[Action]) -> Vec<Msg> {
     let mut out = Vec::with_capacity(actions.len());
     let mut next_id = 1u32;
@@ -49,7 +48,6 @@ fn build(actions: &[Action]) -> Vec<Msg> {
             }
             3 => Msg { msg_type: T_MARKET, side: a.side, order_id: { let id = next_id; next_id += 1; id }, price: 0, qty: a.qty, new_price: 0, new_qty: 0 },
             _ => {
-                // Add (also the fallback when cancel/replace have no live orders)
                 let id = next_id;
                 next_id += 1;
                 live.push(id);
@@ -68,9 +66,8 @@ proptest! {
     fn invariants_hold_after_every_message(actions in prop::collection::vec(action(), 0..600)) {
         let msgs = build(&actions);
         let mut book = Book::new();
-        let mut sink: Vec<Trade> = Vec::new();
         for m in &msgs {
-            book.process(m, &mut sink);
+            book.process(m);
             if let Err(e) = book.check_invariants() {
                 prop_assert!(false, "invariant violated after {:?}: {}", m, e);
             }
@@ -80,15 +77,16 @@ proptest! {
     #[test]
     fn deterministic_same_input_same_output(actions in prop::collection::vec(action(), 0..600)) {
         let msgs = build(&actions);
-        let run = |msgs: &[Msg]| {
+        let run = || {
             let mut b = Book::new();
-            let mut s: Vec<Trade> = Vec::new();
-            for m in msgs { b.process(m, &mut s); }
-            (b.digest(), s)
+            for m in &msgs {
+                b.process(m);
+            }
+            (b.digest(), b.trades.clone())
         };
-        let (d1, s1) = run(&msgs);
-        let (d2, s2) = run(&msgs);
+        let (d1, t1) = run();
+        let (d2, t2) = run();
         prop_assert_eq!(d1, d2);
-        prop_assert_eq!(s1, s2);
+        prop_assert_eq!(t1, t2);
     }
 }
