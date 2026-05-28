@@ -1,0 +1,20 @@
+[package]
+name = "lob"
+version = "0.1.0"
+edition = "2021"
+description = "Limit-order-book matching engine (Rust baseline) for the OCaml-vs-Rust HFT demo"
+
+# The core engine is std-only: no dependencies on the hot path.
+
+[dev-dependencies]
+proptest = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

@@ -1,0 +1,7 @@
+# Golden reference for cross-engine differential testing.
+# Workload: bench/gen_workload with seed=42 count=5000000 (the run_all.sh defaults).
+# Every engine (Rust, idiomatic OCaml, OxCaml) MUST reproduce these EXACTLY.
+# Produced by the Rust reference engine (rust/src/book.rs).
+trades=3120571
+trades_hash=ed41de0b6a9021b2
+book_digest=d7f5afbcb376de90
