@@ -106,7 +106,8 @@ scripts/run_all.sh build all, run, verify differential, chart
 
 - **macOS / Apple Silicon is not a production HFT box** — no core isolation, no kernel bypass,
   thermal/scheduler jitter. These are *relative* numbers under identical conditions, not absolute
-  production latencies. A Linux box with `taskset` core-pinning would tighten every tail.
+  production latencies. A Linux box with `taskset` core-pinning would tighten every tail — see
+  [`docker/`](docker/) for that path (same benchmark, pinned).
 - **The OxCaml toolchain is a 5.2 preview**; flambda2 is younger than the LLVM backend behind
   Rust. Some of the throughput gap is toolchain maturity, not language.
 - Single symbol, single core, in-memory (no networking/persistence) — by design: that is the
@@ -125,6 +126,14 @@ python3 -m venv bench/.venv && bench/.venv/bin/pip install matplotlib numpy
 
 scripts/run_all.sh            # build all, run, verify differential, render charts
 # or: scripts/run_all.sh 1000000 3   # smaller/faster
+```
+
+For cleaner, **core-pinned** numbers on Linux (the whole toolchain in one image; same benchmark
+run under `taskset`), see [`docker/README.md`](docker/README.md):
+
+```bash
+docker build -f docker/Dockerfile -t ocaml-vs-rust-hft:linux .   # ~30-45 min first build
+docker run --rm --cpuset-cpus 1,2 -e PIN_CPU=1 ocaml-vs-rust-hft:linux
 ```
 
 Per-engine tests: `cargo test --manifest-path rust/Cargo.toml`,

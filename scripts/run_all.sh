@@ -13,6 +13,15 @@ RUNS="${2:-5}"
 FLAMBDA_SW="5.4.1-flambda"
 OX_SW="5.2.0+ox"
 
+# Optional core pinning for cleaner tails. Set PIN_CPU=<n> (e.g. in the Docker image, or on a
+# Linux host with an isolated core) to run every harness under `taskset -c <n>`. No-op on macOS
+# where taskset is unavailable.
+PIN=""
+if [ -n "${PIN_CPU:-}" ] && command -v taskset >/dev/null 2>&1; then
+  PIN="taskset -c ${PIN_CPU}"
+  echo "(pinning harnesses to CPU ${PIN_CPU})"
+fi
+
 echo "== building =="
 cargo build --release --manifest-path bench/gen_workload/Cargo.toml
 cargo build --release --manifest-path rust/Cargo.toml
@@ -39,7 +48,7 @@ run_engine() { # label dir harness_path
   : > "$TMP_MPS"
   i=0
   while [ "$i" -lt "$RUNS" ]; do
-    "$harness" bench/orders.bin "$out" 2>"$TMP_ERR" 1>/dev/null || true
+    $PIN "$harness" bench/orders.bin "$out" 2>"$TMP_ERR" 1>/dev/null || true
     grep -oE '[0-9.]+ M msg/s' "$TMP_ERR" | grep -oE '^[0-9.]+' >> "$TMP_MPS" || true
     i=$((i + 1))
   done
