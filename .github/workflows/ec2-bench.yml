@@ -1,0 +1,71 @@
+name: ec2-bench
+
+# Manually-triggered: assume an AWS role via OIDC (no stored keys), then launch a bare-metal EC2
+# instance that runs the pinned benchmark headlessly, uploads results to S3, and self-terminates.
+# This job downloads the results as an artifact and guarantees the instance is torn down.
+#
+# One-time setup (see deploy/ec2/README.md): an OIDC IAM role + these repo Variables/Secrets:
+#   vars.AWS_REGION, vars.BENCH_S3_BUCKET, vars.BENCH_INSTANCE_PROFILE, secrets.AWS_ROLE_ARN
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_type:
+        description: EC2 instance type (x86 bare-metal recommended)
+        default: c7i.metal-24xl
+      n:
+        description: messages per run
+        default: "5000000"
+      runs:
+        description: timed runs (median is reported)
+        default: "5"
+      pin_core:
+        description: isolated core to pin the harness to
+        default: "2"
+      isol_cpus:
+        description: isolcpus/nohz_full/rcu_nocbs cpu list
+        default: "2,3"
+      ttl_min:
+        description: hard self-destruct TTL (minutes)
+        default: "60"
+
+permissions:
+  id-token: write   # required for AWS OIDC
+  contents: read
+
+concurrency:
+  group: ec2-bench
+  cancel-in-progress: false   # never cancel a run that may have a live instance attached
+
+jobs:
+  ec2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Launch → run → fetch → terminate
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          S3_BUCKET: ${{ vars.BENCH_S3_BUCKET }}
+          INSTANCE_PROFILE: ${{ vars.BENCH_INSTANCE_PROFILE }}
+          INSTANCE_TYPE: ${{ inputs.instance_type }}
+          N: ${{ inputs.n }}
+          RUNS: ${{ inputs.runs }}
+          PIN_CORE: ${{ inputs.pin_core }}
+          ISOL_CPUS: ${{ inputs.isol_cpus }}
+          TTL_MIN: ${{ inputs.ttl_min }}
+        run: bash deploy/ec2/run.sh
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ec2-results
+          path: results-*/
+          if-no-files-found: warn

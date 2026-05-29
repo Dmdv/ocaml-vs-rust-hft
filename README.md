@@ -239,6 +239,10 @@ For real pinning the repo provides a Linux path:
   Linux, boot with `isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3`, run with `--cpuset-cpus 2,3 -e
   PIN_CPU=2`, and set the governor to `performance`; then the tail reflects the engine, not the
   scheduler.
+- **Bare-metal EC2**: [`deploy/ec2/`](deploy/ec2/) launches a core-isolated x86 metal instance
+  (isolcpus + nohz_full, tuned governor/C-states/IRQs, SMT sibling offlined), runs the same
+  benchmark pinned, returns the results plus an `environment.txt` proof of the conditions, and
+  self-terminates — the cloud version of the bare-metal recipe above.
 - **CI runs unpinned on purpose**: shared GitHub runners expose no isolated core, so pinning there
   would add noise, not signal.
 
