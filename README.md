@@ -1,26 +1,26 @@
-# OCaml vs Rust for low-latency trading — an honest head-to-head
+# OCaml vs Rust for low-latency trading
 
 [![CI](https://github.com/Dmdv/ocaml-vs-rust-hft/actions/workflows/ci.yml/badge.svg)](https://github.com/Dmdv/ocaml-vs-rust-hft/actions/workflows/ci.yml)
 
-A price-time-priority **limit-order-book matching engine** — the canonical Jane Street workload —
-implemented three ways over **byte-identical input**, with rigorous, fair benchmarks:
+A price-time-priority **limit-order-book matching engine** (the hot loop at the centre of a
+trading system), built three times and run on the **same input bytes**:
 
-| | language / mode | what it shows |
+| | language / mode | notes |
 |---|---|---|
-| **Rust** | stable 1.95, `Vec`-arena + `HashMap`, no GC | the no-GC baseline, and the ownership ceremony it costs |
-| **OCaml — idiomatic** | 5.4.1 + flambda, boxed records + `Hashtbl` | clean, ergonomic OCaml — and its GC tax |
-| **OCaml — zero-alloc** | OxCaml / flambda2, flat arrays + custom int-map | the rebuttal: Rust-class predictability, no GC |
+| **Rust** | stable 1.95, `Vec`-arena + `HashMap`, no GC | the no-GC baseline; the intrusive list costs lifetime/ownership boilerplate |
+| **OCaml — idiomatic** | 5.4.1 + flambda, boxed records + `Hashtbl` | the natural OCaml style; one record allocated per resting order |
+| **OCaml — zero-alloc** | OxCaml / flambda2, flat arrays + custom int-map | the same logic with the heap taken out of the hot path |
 
-All three consume the same 5,000,000-message stream and **produce byte-identical trades and book
-state** (verified by a committed golden hash) — so the benchmark compares *representations*, not
-algorithms. This is the "why OCaml, and why not Rust?" question that Jane Street has answered in
-public for over a decade, reduced to something you can run and measure.
+All three read the same 5,000,000-message stream and produce **byte-identical trades and final
+book state**, checked against a committed golden hash. Because the outputs match, the benchmark
+isolates the one thing that differs between them: how each lays out an order in memory. It is the
+"why OCaml, not Rust?" question Jane Street has written about for years, in a form you can run.
 
-> **The short answer this repo supports:** for HFT, the metric that matters is *tail
-> predictability*, not average speed. Zero-allocation OCaml matches — even slightly beats — Rust
-> at the extreme tail, while costing far less in ceremony than Rust and far less in GC risk than
-> idiomatic OCaml. Rust still wins raw throughput by ~3×. That trade — a little throughput for a
-> lot of expressiveness and safety — is, in their own words, why Jane Street picks OCaml.
+> In short: for this workload the number that matters is the tail, not the average. The
+> zero-allocation OCaml engine holds its worst-case latency level with Rust, and edges ahead at
+> the far tail, while idiomatic OCaml pays for its garbage collector with a millisecond-scale
+> pause. Rust keeps a roughly 3× lead on throughput. Trading some of that throughput for OCaml's
+> expressiveness and safety is the bargain Jane Street has chosen.
 
 ## Results (Apple Silicon, median of 5 runs, 5M messages → 3.12M trades)
 
@@ -44,55 +44,60 @@ public for over a decade, reduced to something you can run and measure.
 
 ![Throughput](bench/results/throughput.png)
 
-## What the numbers actually say
+## Reading the results
 
-**1. Tail latency — the thing HFT cares about — favours the zero-alloc design.**
-Idiomatic OCaml allocates a record per resting order; over 5M messages that triggers 74 minor
-collections, and the worst single message takes **1.24 ms** — a GC pause, ~28,000× its median.
-The zero-alloc engine allocates *nothing* on the hot path, takes **zero** GC cycles, and its
-worst message is **45 µs** — actually *below* Rust's 60 µs worst. When your risk is "a GC pause
-mid-quote", eliminating the GC from the hot path matters more than shaving nanoseconds off the
-median. This is exactly Jane Street's "zero-allocation style", and the motivation for OxCaml.
+**1. The tail goes to the zero-alloc design.** Idiomatic OCaml allocates one record per resting
+order. Over 5M messages that triggers 74 minor collections, and the slowest single message takes
+**1.24 ms**, a GC pause about 28,000× the median. The zero-alloc engine never touches the heap on
+the hot path, runs **zero** GC cycles, and its slowest message is **45 µs**, under Rust's 60 µs.
+If the risk you care about is a collector pause landing mid-quote, taking the GC out of the hot
+path buys far more than trimming nanoseconds off the median. This is the "zero-allocation style"
+Jane Street writes about, and the reason OxCaml exists.
 
-**2. Raw throughput and median latency still favour Rust (~3× / ~2×).** We report this plainly.
-Part is a more mature optimizer (LLVM vs flambda2 on the OxCaml 5.2 preview), part is Rust's
-`hashbrown` `HashMap` (SIMD probing) versus our hand-written OCaml int-map. This matches Jane
-Street's own candor: *"we're fighting a fundamental disadvantage… anyone can write fast C++, but
-it takes a real expert to write fast OCaml."* OCaml does not magically equal Rust on a hot loop.
+**2. Throughput and median latency still go to Rust (~3× and ~2×).** Some of that is a more mature
+optimizer (LLVM against flambda2 in the OxCaml 5.2 preview); some is Rust's `hashbrown` `HashMap`,
+with its SIMD probing, against a hand-written OCaml int-map. It matches what Jane Street's own
+engineers say: *"we're fighting a fundamental disadvantage… anyone can write fast C++, but it
+takes a real expert to write fast OCaml."* On a tight loop, OCaml does not pull level with Rust.
 
-**3. The zero-alloc discipline is mostly stock OCaml; OxCaml's job is to make it safe & ergonomic.**
-For an *int-keyed* book, OCaml ints are already unboxed, so the only idiomatic allocations were
-the boxed node record and `Hashtbl` options/buckets. Removing them (struct-of-arrays / a flat
-strided arena + a custom map) is expressible in plain OCaml — it's just less pleasant. OxCaml's
-contribution, per its docs, is (a) **unboxed record types** that give this flat layout with
-record *syntax*, and (b) a **mode system** that can *prove* a function never allocates and is
-data-race free — turning a hand-discipline into a machine-checked one. (Note: OxCaml's SIMD is
-x86-only, so unused here on arm64.)
+**3. Most of the zero-alloc work is plain OCaml; OxCaml makes it safe and readable.** In an
+int-keyed book OCaml's ints are already unboxed, so the only allocations in the idiomatic version
+were the boxed node record and the `Hashtbl`'s options and buckets. You can remove those in
+ordinary OCaml, with a flat strided arena and a custom map; it is just tedious to write and easy
+to get wrong. What OxCaml adds, per its docs, is (a) **unboxed record types**, which give the same
+flat layout with record syntax instead of manual offset arithmetic, and (b) a **mode system** that
+proves at compile time that a function never allocates and is free of data races. It turns a
+hand-kept discipline into one the compiler enforces. (OxCaml's SIMD is x86-only, so it is unused
+here on arm64.)
 
-**4. Expressiveness — the other half of the case.** See [`docs/expressiveness/`](docs/expressiveness/):
-modelling order status as a sum type makes "cancel an already-filled order" a *compile error*,
-and adding an `Iceberg` order kind makes the compiler point at every match that must change.
-Rust does this too (and is stricter — a non-exhaustive match is an error, not a warning); the
-honest difference is ceremony at scale, which is a productivity judgment, not a benchmark.
+**4. Latency is only half the argument; expressiveness is the rest.** See
+[`docs/expressiveness/`](docs/expressiveness/): modelling order status as a sum type turns "cancel
+an already-filled order" into a *compile error*, and adding an `Iceberg` order kind makes the
+compiler list every match that now needs updating. Rust does the same, and is stricter about it:
+a non-exhaustive match is an error there, not a warning. The difference is how much ceremony each
+demands across a large codebase, which is a judgment about day-to-day productivity rather than
+something this benchmark measures.
 
-## How it's built (and why it's fair)
+## How it's built
 
-- **One shared contract** — [`spec/protocol.md`](spec/protocol.md): a fixed 24-byte binary
-  message format and exact matching semantics (price-time priority; trade at the maker price;
-  market/limit/cancel/replace).
-- **One neutral workload** — [`bench/gen_workload`](bench/gen_workload) (Rust, seeded) emits the
-  identical byte stream every engine reads. Realistic mix: ~60% add / 30% cancel / 5% replace /
-  5% market, prices clustered around a random-walking mid.
-- **Identical algorithm + data structure** in all three: an array price ladder for O(1)
-  best-price, an index-arena intrusive FIFO per level for O(1) cancel, a hash map id→slot. The
-  *only* deliberate difference is representation (boxed records vs flat arrays) and language.
-- **Differential testing gate**: `scripts/run_all.sh` fails unless all three reproduce the
-  committed golden `trades_hash` + `book_digest`. That equality is what makes the latency
-  comparison meaningful — they are provably doing the same work.
-- **Fair measurement**: same input bytes; warmup + median-of-N; max opt flags both sides (Rust
-  `--release` + `lto=fat` + `codegen-units=1`; OCaml flambda `-O3`); array bounds checks left on
-  in *both* OCaml and Rust; per-op timing via the same `mach_absolute_time` source (a zero-alloc
-  C stub on the OCaml side) so the clocks match.
+- **One shared contract**, [`spec/protocol.md`](spec/protocol.md): a fixed 24-byte binary message
+  format and the matching rules (price-time priority; trades print at the maker's price;
+  add/cancel/replace/market).
+- **One workload generator**, [`bench/gen_workload`](bench/gen_workload) (Rust, seeded), writes the
+  byte stream every engine reads. The mix is ~60% add / 30% cancel / 5% replace / 5% market, with
+  prices clustered around a mid that random-walks.
+- **The same algorithm and data structures** in all three: an array price ladder for O(1)
+  best-price access, an index-arena intrusive FIFO at each level for O(1) cancel, and a hash map
+  from order id to slot. The only deliberate difference is how an order is represented (boxed
+  records versus flat arrays) and the language itself.
+- **A differential gate**: `scripts/run_all.sh` fails unless all three reproduce the committed
+  golden `trades_hash` and `book_digest`. That check is what lets the latency numbers mean
+  something: it shows the three are doing identical work.
+- **Like-for-like measurement**: same input bytes; a warmup pass and median-of-N runs; full
+  optimization on both sides (Rust `--release` with `lto=fat` and `codegen-units=1`, OCaml flambda
+  `-O3`); array bounds checks left on in both languages; and per-message timing from the same
+  `mach_absolute_time` clock (reached through a zero-alloc C stub on the OCaml side) so both are
+  measured the same way.
 
 ```
 spec/        the shared protocol + matching spec + golden hash
@@ -104,18 +109,18 @@ docs/        design, plan, and the expressiveness demo
 scripts/run_all.sh build all, run, verify differential, chart
 ```
 
-## Honest caveats
+## Caveats
 
-- **macOS / Apple Silicon is not a production HFT box** — no core isolation, no kernel bypass,
-  thermal/scheduler jitter. These are *relative* numbers under identical conditions, not absolute
-  production latencies. A Linux box with `taskset` core-pinning would tighten every tail — see
-  [`docker/`](docker/) for that path (same benchmark, pinned).
-- **The OxCaml toolchain is a 5.2 preview**; flambda2 is younger than the LLVM backend behind
-  Rust. Some of the throughput gap is toolchain maturity, not language.
-- Single symbol, single core, in-memory (no networking/persistence) — by design: that is the
-  canonical Jane Street feed-handler/matching hot loop, not a whole exchange.
-- Allocation is measured differently per runtime (OCaml `Gc.minor_words`, Rust a counting global
-  allocator); both are documented in the harnesses.
+- **A MacBook is not a production trading box.** No core isolation, no kernel bypass, and
+  scheduler and thermal jitter throughout. Read these as relative numbers measured under identical
+  conditions, not as absolute production latencies. A Linux host with `taskset` core-pinning would
+  pull in every tail; [`docker/`](docker/) runs the same benchmark that way.
+- **OxCaml is a 5.2 preview**, and flambda2 is a much younger backend than the LLVM behind Rust.
+  Part of the throughput gap is toolchain maturity rather than anything about the language.
+- **One symbol, one core, in memory** (no networking or persistence). That is deliberate: the
+  target is the matching hot loop itself, not a whole exchange.
+- **Allocation is counted differently per runtime**: `Gc.minor_words` in OCaml, a counting global
+  allocator in Rust. Both methods are documented in the harness code.
 
 ## Reproduce
 
@@ -130,7 +135,7 @@ scripts/run_all.sh            # build all, run, verify differential, render char
 # or: scripts/run_all.sh 1000000 3   # smaller/faster
 ```
 
-For cleaner, **core-pinned** numbers on Linux (the whole toolchain in one image; same benchmark
+For cleaner, core-pinned numbers on Linux (the whole toolchain in one image, the same benchmark
 run under `taskset`), see [`docker/README.md`](docker/README.md):
 
 ```bash
@@ -146,9 +151,10 @@ Per-engine tests: `cargo test --manifest-path rust/Cargo.toml`,
 - Yaron Minsky, *OCaml for the Masses* (CACM, 2011) — readability as risk control.
 - *Oxidizing OCaml: Locality* & *Introducing OxCaml* (blog.janestreet.com, 2025) — zero-alloc
   style, stack allocation, modes, unboxed types.
-- *Performance Engineering on Hard Mode* (Signals & Threads) — the candid GC/boxiness admission.
+- *Performance Engineering on Hard Mode* (Signals & Threads) — where they concede the GC/boxiness
+  disadvantage.
 - *Building Tools for Traders* / *Safe at Any Speed* — the order-book and feed-handler workloads
   (sub-microsecond per message).
 - [oxcaml.org](https://oxcaml.org) — modes, stack allocation, unboxed types.
 
-_Built as a demonstration; see `docs/plans/` for the design + implementation plan._
+_A demonstration project; the design and implementation plan are in `docs/plans/`._
