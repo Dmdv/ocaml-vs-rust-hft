@@ -95,6 +95,35 @@ For a matching engine the tail, not the mean, is the number you design against:
   is a stop-the-world minor collection, and the zero-alloc curve has no cliff because it never
   collects.
 
+## Understanding the OCaml side (for readers new to OCaml)
+
+The gap between the two OCaml builds is entirely about how each represents data at runtime, so a
+short primer on OCaml's model makes the numbers legible.
+
+- **Boxing and the GC.** OCaml is garbage-collected with a generational heap. By default, compound
+  values — records, tuples, variants, closures — are *boxed*: allocated on the heap and referenced
+  by a pointer. Plain `int` (and a few other immediates) are the exception — *unboxed*, living
+  directly in a machine word. New allocations go into a small *minor heap*; when it fills, a
+  *stop-the-world minor collection* runs. Each collection is short, but it is a pause, and in a
+  per-message hot loop a pause is precisely the tail event you are trying to avoid.
+- **Why the idiomatic engine allocates.** It stores every resting order as a boxed record (one heap
+  block per live order) and uses the standard-library `Hashtbl`, whose lookups return a boxed
+  `option` and whose inserts allocate bucket cells. That steady drip of allocation is what drives
+  the 74 minor collections; one of them occasionally lands in the middle of a message, which is the
+  1.24 ms tail.
+- **Why the zero-alloc engine doesn't.** It keeps each order's fields as plain `int`s packed into
+  one flat, strided `int array` (an arena), and replaces `Hashtbl` with a hand-written
+  open-addressing `int → int` map. Because `int` is unboxed, none of this touches the heap: zero
+  allocations, zero collections, no GC pause to land in the tail. All of it is possible in
+  *ordinary* OCaml — it is just manual offset arithmetic with no compiler help if you slip.
+- **What OxCaml adds.** It makes that discipline ergonomic and *checkable*. **Unboxed record types**
+  recover the flat, cache-dense layout with ordinary record syntax instead of hand-coded offsets;
+  the **mode system** lets the compiler *prove* that a function allocates nothing and is free of
+  data races, turning a hand-maintained invariant into one the type checker enforces. (Modes are,
+  loosely, to allocation and aliasing what Rust's borrow checker is to ownership — but opt-in and
+  local, applied only on the hot path rather than pervasively.) OxCaml's SIMD intrinsics are
+  x86-only, so they are unused here on arm64.
+
 ## What to take away
 
 Five conclusions the numbers support, past "Rust is faster":
