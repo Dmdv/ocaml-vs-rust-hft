@@ -150,15 +150,55 @@ scripts/run_all.sh build all, run, verify differential, chart
 
 - **A laptop is not a production trading box.** No core isolation, no kernel bypass, SMT and
   frequency scaling and scheduler preemption all in play. Treat these as relative numbers under
-  identical conditions, not absolute production latencies. A Linux host with `isolcpus` +
-  `taskset` pinning collapses the OS-induced part of every tail; [`docker/`](docker/) runs the same
-  benchmark pinned.
+  identical conditions, not absolute production latencies. Why this hardware can't be core-pinned
+  at all, and how to pin properly on Linux, is its own section below.
 - **OxCaml is a 5.2 preview**; flambda2 is a much younger backend than the LLVM behind Rust. Part
   of the throughput gap is toolchain maturity, not the language.
 - **One symbol, one core, in memory** — no networking, no persistence. Deliberate: the target is
   the matching hot loop, not a full venue.
 - **Allocation is measured per-runtime**: `Gc.minor_words` deltas in OCaml, a counting
   `GlobalAlloc` in Rust. Both methods are in the harness source.
+
+## Core pinning
+
+The headline run is on an Apple Silicon laptop — the development machine, not a trading box. That
+is fine for what this benchmark claims: a *relative* comparison needs only identical conditions
+across the three engines (same machine, same input bytes, same clock), which any single machine
+provides. Absolute, production-grade latency is a different goal and wants a tuned Linux server —
+which is what the Docker/Linux path below is for. OxCaml also runs natively on arm64 macOS (stack
+allocation, modes and unboxed types all work; only its SIMD intrinsics are x86-only, and unused
+here), so the zero-alloc engine needs no emulation.
+
+These numbers are **not** core-pinned, and on this hardware they can't be:
+
+- **macOS has never offered hard core-pinning** on any architecture: no `taskset`, no "run this
+  thread on core N." It has the **Thread Affinity API** (`thread_policy_set` with
+  `THREAD_AFFINITY_POLICY`), which sets *affinity tags* — a hint that threads sharing a tag be
+  scheduled onto the same L2 cache (hence the same physical core) when possible. That is
+  cache-locality grouping, not pinning, and not a guarantee.
+- **On Apple Silicon (arm64) the affinity API is unavailable.** The kernel's
+  `ml_get_max_affinity_sets()` is hardcoded to `0`, so `thread_policy_set(…, THREAD_AFFINITY_POLICY,
+  …)` returns `KERN_NOT_SUPPORTED` (error 46). Apple's sanctioned alternative is **QoS classes**,
+  which bias work toward performance vs efficiency cores but cannot pin a thread or stop migration
+  and preemption.
+
+For real pinning the repo provides a Linux path:
+
+- `scripts/run_all.sh` honours `PIN_CPU=<n>` and wraps each harness in `taskset -c <n>` (a no-op
+  where `taskset` is absent, i.e. macOS; active on Linux).
+- Docker runs pinned: `docker run --cpuset-cpus 1,2 -e PIN_CPU=1 …`. On Docker Desktop for macOS
+  this pins to a **VM vCPU** — it cuts migration jitter but is not real isolation. On bare-metal
+  Linux, boot with `isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3`, run with `--cpuset-cpus 2,3 -e
+  PIN_CPU=2`, and set the governor to `performance`; then the tail reflects the engine, not the
+  scheduler.
+- **CI runs unpinned on purpose**: shared GitHub runners expose no isolated core, so pinning there
+  would add noise, not signal.
+
+References:
+[Affinity API release notes](https://developer.apple.com/library/archive/releasenotes/Performance/RN-AffinityAPI/) ·
+[`thread_policy_set`](https://developer.apple.com/documentation/kernel/1418892-thread_policy_set) ·
+[Apple forums — affinity on Apple Silicon](https://developer.apple.com/forums/thread/703361) ·
+[Binding threads to cores on OSX](https://www.hybridkernel.com/2015/01/18/binding_threads_to_cores_osx.html)
 
 ## Reproduce
 
