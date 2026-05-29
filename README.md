@@ -18,12 +18,13 @@ representation of an order — and holds the algorithm, data structures, and inp
 the "why OCaml, not Rust?" question Jane Street has written about for years, reduced to something
 you can build and measure.
 
-> **Bottom line:** on this workload the figure that matters is tail latency, not the mean. The
-> zero-allocation OCaml engine holds its tail level with Rust (and slightly lower at the extreme),
-> while the idiomatic encoding's minor GC injects a stop-the-world pause three orders of magnitude
-> above its median. Rust keeps a ~3× throughput lead — a more mature optimizer and a faster hash
-> table, not a language-level law. Spending that throughput to buy OCaml's type system and lower
-> defect rate is the trade Jane Street makes.
+> **Bottom line.** Rust wins on raw speed — ~3× the throughput and lower latency at every
+> percentile through p99.99. But for a matching engine the figure you engineer against is the
+> *worst case*, and there it flips: zero-allocation OCaml holds level with Rust (both in the tens
+> of microseconds), while idiomatic OCaml takes a **1.24 ms** stop-the-world GC pause — 28× its own
+> median. Rank by speed and it's Rust; rank by *predictable tails plus a stronger type system* and
+> zero-alloc OCaml sits in Rust's neighbourhood at ~⅓ the throughput. Trading some speed for safety
+> and predictability is the bet Jane Street makes — quantified below.
 
 ## Results (Apple Silicon, median of 5 runs, 5M messages → 3.12M trades)
 
@@ -47,6 +48,26 @@ you can build and measure.
 
 ![Throughput](bench/results/throughput.png)
 
+## Who wins
+
+| Dimension | Winner | Margin |
+|---|---|---|
+| Throughput | **Rust** | ~3× — 29.2 vs 9.3–10.0 M msg/s |
+| Typical latency (p50 → p99.99) | **Rust** | lowest at every percentile; ~2× at the median |
+| Worst case (`max`) | **Rust ≈ zero-alloc OCaml** | 60 µs vs 45 µs (same order); idiomatic OCaml **1.24 ms**, 20–28× worse |
+| Hot-path allocation / GC pauses | **tie — Rust & zero-alloc OCaml** | 0 each; idiomatic OCaml takes 74 GC pauses |
+| Type safety / refactorability | **OCaml** (qualitative) | [`docs/expressiveness/`](docs/expressiveness/) |
+
+**Verdict.** On raw speed, **Rust wins outright** — about 3× the throughput and the lowest latency
+at every percentile up to p99.99. The result that matters for trading, though, is the **worst
+case**, and there it is a different story: **zero-allocation OCaml pulls level with Rust** (both in
+the tens of microseconds), while **idiomatic OCaml takes a 1.24 ms garbage-collector pause** — 28×
+its own median and ~20× the zero-alloc build. So rank engines by throughput and it is Rust; rank by
+*predictable worst-case latency plus type safety* and zero-alloc OCaml lands in Rust's
+neighbourhood at roughly a third of the throughput. That two-sided outcome — Rust faster on
+average, OCaml competitive on the tail it is designed around — is the trade behind Jane Street's
+choice.
+
 ### How to read the percentiles
 
 We time each message's `process` call and sort the samples. Every column is a percentile of that
@@ -69,48 +90,45 @@ For a matching engine the tail, not the mean, is the number you design against:
 - **The shape is a diagnosis.** The median reflects raw per-message compute; the gap from median to
   tail is jitter, and its causes are identifiable — allocation/GC, cache misses, branch
   mispredicts, scheduler preemption. A curve that stays flat from p50 to `max` is *predictable*; a
-  knee at the high percentiles means something stalls intermittently. Here the idiomatic OCaml
-  curve is flat until it jumps ~28,000× at `max` — a stop-the-world minor collection. The
-  zero-alloc curve has no knee because it never collects. Rust and zero-alloc OCaml are flat;
-  idiomatic OCaml is flat-then-cliff.
+  knee at the high percentiles means something stalls intermittently. In the chart, Rust and
+  zero-alloc OCaml stay flat; idiomatic OCaml is flat until it jumps ~28,000× at `max` — that cliff
+  is a stop-the-world minor collection, and the zero-alloc curve has no cliff because it never
+  collects.
 
-## Interpreting the results
+## What to take away
 
-**1. The tail goes to the zero-alloc engine.** *("The tail goes to X" is shorthand: of the three,
-X wins on tail latency — the p99.9 / p99.99 / `max` columns above, the worst cases — which is a
-separate question from who wins the median. The same "goes to X" phrasing is reused for the other
-metrics below.)* The idiomatic encoding allocates one boxed record per resting order; over 5M
-messages that drives 74 minor collections, and the worst single message is **1.24 ms** — ~28,000×
-its own median, i.e. a stop-the-world minor GC caught in the timed region. The zero-alloc engine makes no hot-path allocations, triggers **zero** collections,
-and tops out at **45 µs**, below Rust's 60 µs `max`. When the failure mode is a collector pause
-landing between a quote and its fill, removing allocation from the hot path dominates median
-nanoseconds. This is the "zero-allocation style" Jane Street documents, and the motivation for
-OxCaml.
+Five conclusions the numbers support, past "Rust is faster":
 
-**2. Throughput and median latency still go to Rust (~3× and ~2×).** Two causes, both below the
-language level: a more mature optimizer (LLVM vs flambda2 in the OxCaml 5.2 preview), and Rust's
-`hashbrown` `HashMap` with SIMD probing vs a hand-written open-addressing int→int map on the OCaml
-side. It matches what Jane Street's engineers say outright: *"we're fighting a fundamental
-disadvantage… anyone can write fast C++, but it takes a real expert to write fast OCaml."* On a
-tight loop, OCaml does not reach Rust.
+**1. OCaml's GC cost is a *tail* cost, not an average cost.** The idiomatic median is only ~2× Rust
+(83 vs 41 ns) — survivable on its own — but its worst message is **1.24 ms**, ~28,000× that median,
+because a stop-the-world minor collection occasionally lands inside a `process` call. A benchmark
+that reported only throughput and median would hide the single behaviour that actually threatens a
+trading system.
 
-**3. Most of the zero-alloc work is ordinary OCaml; OxCaml makes it machine-checked.** OCaml `int`
-is unboxed, so in an int-keyed book the only idiomatic allocations are the boxed node record and
-the `Hashtbl`'s `option` results and bucket cells. Both are removable in plain OCaml — a flat
-strided `int array` arena plus a custom int→int map — at the cost of manual offset arithmetic and
-no compiler check when you slip. OxCaml adds (a) **unboxed record types**, which recover that flat
-layout with record syntax instead of hand-coded offsets, and (b) a **mode system** that proves at
-compile time that a function allocates nothing and is data-race-free. It converts a
-hand-maintained invariant into one the type checker enforces. (OxCaml's SIMD intrinsics are
-x86-only, so they are unused here on arm64.)
+**2. Zero-allocation discipline buys predictability, not speed.** Going zero-alloc barely moved
+throughput (10.0 vs 9.3 M msg/s) or the median — but it cut the worst case from 1.24 ms to **45 µs**
+and removed all **74** GC pauses. You don't write zero-alloc OCaml to go faster; you write it to
+take the collector out of the tail. For HFT that is the payoff that counts.
 
-**4. Latency is half the case; expressiveness is the other half.** See
-[`docs/expressiveness/`](docs/expressiveness/): encoding order status as a sum type makes "cancel
-an already-filled order" a *type error*, and adding an `Iceberg` constructor makes the compiler
-enumerate every non-exhaustive `match` that now needs a case. Rust does the same and is stricter —
-a non-exhaustive match is a hard error there, not a warning (`-w` vs `E0004`). The practical
-difference is the ceremony each demands across a large codebase, which is a productivity argument,
-not something this benchmark measures.
+**3. Rust's remaining lead is codegen, not garbage collection.** Rust is ~3× faster than
+*zero-alloc* OCaml even though both allocate essentially nothing on the hot path — so that gap is
+not a GC tax. It is the optimizer (LLVM vs the flambda2 preview) and the hash table (`hashbrown`'s
+SIMD probing vs a hand-written int→int map): the part that narrows with toolchain maturity, not the
+part fixed by choosing a GC'd language. As Jane Street put it: *"anyone can write fast C++, but it
+takes a real expert to write fast OCaml."*
+
+**4. The case for OCaml is not only latency.** Encoding order status as a sum type makes "cancel an
+already-filled order" a *type error*; adding an `Iceberg` constructor makes the compiler enumerate
+every non-exhaustive `match` to fix. Rust gives the same guarantee, often more strictly (`E0004` is
+a hard error, not a warning) — so this is not a win OCaml owns outright; the difference is the
+ceremony each demands at scale, which this benchmark doesn't measure. See
+[`docs/expressiveness/`](docs/expressiveness/).
+
+**5. The decision this supports.** Need maximum single-core throughput? Rust. Need a *predictable*
+worst case **and** OCaml's type system and refactorability? Zero-alloc OCaml gives Rust-class tail
+latency at ~⅓ the throughput, with the GC pause engineered out. For a system bounded by
+predictability and correctness-at-scale rather than by peak message rate, that is a rational,
+*measured* trade — not a slogan.
 
 ## How it's built
 
@@ -129,7 +147,8 @@ not something this benchmark measures.
   generic sink, which OCaml can't match; it was removed so neither side gets a dispatch edge).
 - **Differential gate**: `scripts/run_all.sh` fails unless all three reproduce the committed golden
   `trades_hash` and `book_digest`. That check is what makes the latency numbers comparable — it
-  proves the three did identical work, bit for bit.
+  proves the three did identical work, bit for bit. (CI runs it on x86-64 Linux; the golden also
+  reproduces there, not just on the arm64 dev machine.)
 - **Like-for-like measurement**: same input bytes; warmup pass + median-of-N runs; full
   optimisation both sides (Rust `--release`, `lto=fat`, `codegen-units=1`, `target-cpu=native`;
   OCaml flambda `-O3`); array bounds checks left **on** in both languages; per-message timing from
