@@ -23,7 +23,7 @@ let () =
   let warmup = n / 10 in
 
   (* ---- Pass L: timed per-op latency ---- *)
-  let b = create ~trade_cap:(max 1 n) () in
+  let b = create ~trade_cap:(max 1 n) ~orders:(1 lsl 20) () in
   let lat = Array.make (max 1 n) 0 in
   for i = 0 to n - 1 do
     let off = i * 24 in
@@ -52,7 +52,7 @@ let () =
   close_out oc;
 
   (* ---- Pass T: timed bulk throughput + allocations ---- *)
-  let b = create ~trade_cap:(max 1 n) () in
+  let b = create ~trade_cap:(max 1 n) ~orders:(1 lsl 20) () in
   let g0 = Gc.minor_words () in
   let mc0 = (Gc.quick_stat ()).Gc.minor_collections in
   let t0 = now_ns () in

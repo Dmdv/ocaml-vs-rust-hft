@@ -46,7 +46,7 @@ type t = {
   mutable tr_n : int;
 }
 
-let create ?(trade_cap = 256) () =
+let create ?(trade_cap = 256) ?(orders = 1 lsl 16) () =
   {
     nodes = Array.make (1 lsl 16) dummy;
     cap = 1 lsl 16;
@@ -57,7 +57,7 @@ let create ?(trade_cap = 256) () =
     bids_tail = Array.make max_price nil;
     asks_head = Array.make max_price nil;
     asks_tail = Array.make max_price nil;
-    id_tbl = Hashtbl.create (1 lsl 16);
+    id_tbl = Hashtbl.create orders;
     bb = -1;
     ba = max_price;
     tr_maker = Array.make trade_cap 0;
