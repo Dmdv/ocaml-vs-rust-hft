@@ -82,5 +82,12 @@ done
   exit 1
 }
 
-echo "== analyzing =="
-bench/.venv/bin/python bench/analyze.py
+if [ "${SKIP_ANALYZE:-0}" = "1" ]; then
+  echo "== skipping analysis (SKIP_ANALYZE=1) =="
+elif [ -x bench/.venv/bin/python ]; then
+  echo "== analyzing =="
+  bench/.venv/bin/python bench/analyze.py
+else
+  echo "== skipping analysis: no bench/.venv =="
+  echo "   (python3 -m venv bench/.venv && bench/.venv/bin/pip install matplotlib numpy)"
+fi

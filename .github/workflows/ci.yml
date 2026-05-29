@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to the same ref cancels an in-progress run (the first cold run builds two OCaml
+# compilers, so don't waste minutes on superseded commits).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  differential:
+    name: Build 3 engines + verify differential
+    runs-on: ubuntu-latest
+    env:
+      FLAMBDA_SW: 5.4.1-flambda
+      OX_SW: 5.2.0+ox
+      OPAMYES: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Mirrors docker/Dockerfile's apt list. opam is installed from apt; sandboxing is disabled
+      # below (GitHub runners can't always bubblewrap), so we don't need bubblewrap.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git curl ca-certificates m4 pkg-config unzip rsync \
+            libgmp-dev autoconf opam
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust
+            bench/gen_workload
+
+      # The OCaml compiler switches (flambda 5.4.1 + the OxCaml 5.2.0 branch) take ~40 min to
+      # build from source, so cache ~/.opam. Bump the key suffix (-v1) to force a clean rebuild.
+      - name: Cache opam switches
+        uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          key: opam-${{ runner.os }}-flambda5.4.1-ox5.2.0-v1
+
+      - name: Set up opam + OCaml switches
+        run: |
+          opam init --bare --disable-sandboxing -y
+          if ! opam switch list --short | grep -qx "$FLAMBDA_SW"; then
+            echo "creating $FLAMBDA_SW (flambda)"
+            opam switch create "$FLAMBDA_SW" \
+              --packages=ocaml-variants.5.4.1+options,ocaml-option-flambda
+            opam install -y --switch "$FLAMBDA_SW" dune core mtime
+          fi
+          if ! opam switch list --short | grep -qx "$OX_SW"; then
+            echo "creating $OX_SW (oxcaml)"
+            opam switch create "$OX_SW" \
+              --repos ox=git+https://github.com/oxcaml/opam-repository.git,default
+            opam install -y --switch "$OX_SW" dune
+          fi
+          # Fail fast if a restored cache is incomplete.
+          opam exec --switch "$FLAMBDA_SW" -- ocaml -version
+          opam exec --switch "$OX_SW" -- ocaml -version
+
+      - name: Rust unit + property tests
+        run: cargo test --manifest-path rust/Cargo.toml
+
+      - name: OCaml unit tests (idiomatic + oxcaml)
+        run: |
+          opam exec --switch "$FLAMBDA_SW" -- dune test --root ocaml/idiomatic
+          opam exec --switch "$OX_SW" -- dune test --root ocaml/oxcaml
+
+      # The headline gate: build all three engines, regenerate the seeded 5M workload, run each
+      # once, and assert all three reproduce the committed golden trades_hash + book_digest.
+      # (5M matches spec/golden.txt; RUNS=1 because the digest is deterministic. SKIP_ANALYZE
+      # avoids the matplotlib dependency — CI verifies correctness, not chart rendering.)
+      - name: Build all engines + run differential
+        env:
+          SKIP_ANALYZE: "1"
+        run: scripts/run_all.sh 5000000 1

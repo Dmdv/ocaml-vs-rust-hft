@@ -1,5 +1,7 @@
 # OCaml vs Rust for low-latency trading — an honest head-to-head
 
+[![CI](https://github.com/Dmdv/ocaml-vs-rust-hft/actions/workflows/ci.yml/badge.svg)](https://github.com/Dmdv/ocaml-vs-rust-hft/actions/workflows/ci.yml)
+
 A price-time-priority **limit-order-book matching engine** — the canonical Jane Street workload —
 implemented three ways over **byte-identical input**, with rigorous, fair benchmarks:
 
